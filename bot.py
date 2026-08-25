@@ -240,6 +240,117 @@ async def on_message(message):
 
 
 # ============================================================
+# SYNC TODAY'S SCORES
+# ============================================================
+
+async def sync_today_scores(guild):
+    """
+    Read today's messages from the server and add any missing
+    Krillion scores to the database.
+
+    Messages are read oldest-first so the first submission
+    from each user counts, matching normal message handling.
+
+    Returns the number of new scores added.
+    """
+
+    today = datetime.now(PUZZLE_TIMEZONE).date()
+    puzzle = get_todays_puzzle()
+
+    # Start/end of today in Eastern Time.
+    start_of_day = datetime.combine(
+        today,
+        datetime.min.time(),
+        tzinfo=PUZZLE_TIMEZONE
+    )
+
+    end_of_day = datetime.combine(
+        today,
+        datetime.max.time(),
+        tzinfo=PUZZLE_TIMEZONE
+    )
+
+    added = 0
+
+    for channel in guild.text_channels:
+
+        try:
+            async for message in channel.history(
+                after=start_of_day,
+                before=end_of_day,
+                limit=None,
+                oldest_first=True
+            ):
+
+                # Ignore messages sent by bots.
+                if message.author.bot:
+                    continue
+
+                # Parse the message.
+                result = parse_score(message.content)
+
+                if result is None:
+                    continue
+
+                message_puzzle, score = result
+
+                # Only accept today's puzzle.
+                if message_puzzle != puzzle:
+                    continue
+
+                user_id = message.author.id
+                username = message.author.display_name
+                guild_id = guild.id
+
+                # Check whether this user already has a score.
+                cursor.execute("""
+                    SELECT score
+                    FROM scores
+                    WHERE guild_id = ?
+                    AND user_id = ?
+                    AND puzzle = ?
+                """, (
+                    guild_id,
+                    user_id,
+                    puzzle
+                ))
+
+                existing = cursor.fetchone()
+
+                if existing:
+                    continue
+
+                # Add the score.
+                cursor.execute("""
+                    INSERT INTO scores
+                    (guild_id, user_id, username, puzzle, score)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    guild_id,
+                    user_id,
+                    username,
+                    puzzle,
+                    score
+                ))
+
+                db.commit()
+                added += 1
+
+        except discord.Forbidden:
+            print(
+                f"Could not read messages in #{channel.name} "
+                f"in {guild.name}: missing permissions."
+            )
+
+        except discord.HTTPException as error:
+            print(
+                f"Discord error reading #{channel.name}: {error}"
+            )
+
+    return added
+
+
+# ============================================================
 # LEADERBOARD FUNCTIONS
 # ============================================================
 
@@ -301,6 +412,43 @@ async def create_leaderboard_embed(
     )
 
     return embed
+
+
+# ============================================================
+# /sync
+# ============================================================
+
+@tree.command(
+    name="sync",
+    description="Sync today's Krillion scores from server messages"
+)
+@app_commands.default_permissions(
+    manage_guild=True
+)
+async def sync_command(
+    interaction: discord.Interaction
+):
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    added = await sync_today_scores(
+        interaction.guild
+    )
+
+    await interaction.followup.send(
+        f"✅ Sync complete. Added **{added} new score(s)** "
+        f"for puzzle **#{get_todays_puzzle()}**.",
+        ephemeral=True
+    )
 
 
 # ============================================================
@@ -573,7 +721,6 @@ async def nightly_leaderboard():
 
     # Today's puzzle.
     puzzle = get_todays_puzzle()
-
     today = now.date()
 
     # Get every guild that has automatic leaderboards enabled.
@@ -606,6 +753,10 @@ async def nightly_leaderboard():
 
         if guild is None:
             continue
+
+        # Sync any scores submitted while the bot
+        # was offline before creating the leaderboard.
+        await sync_today_scores(guild)
 
         channel = guild.get_channel(channel_id)
 
@@ -690,6 +841,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="📢 Automatic Leaderboard",
         value=(
+            "`/sync` — Sync today's scores from server messages\n"
             "`/leaderboard_auto enabled:On/Off` — "
             "Enable or disable the nightly public leaderboard\n"
             "`/leaderboard_auto_channel channel:#channel` — "
