@@ -1,9 +1,9 @@
 import unittest
+from datetime import date
 
-from bot import parse_score
 from bot import START_DATE
 from bot import START_PUZZLE
-from datetime import date
+from bot import parse_score
 
 
 class TestScoreParser(unittest.TestCase):
@@ -28,24 +28,20 @@ class TestScoreParser(unittest.TestCase):
 
         self.assertEqual((41, 415), result)
 
-
     def test_another_valid_submission(self):
         result = parse_score("Krillion #40 🦐 335 🐟🦑🫧🦑🦑🐟🏮")
 
         self.assertEqual((40, 335), result)
-
 
     def test_score_zero(self):
         result = parse_score("Krillion #41 🦐 0 🏮🏮🏮🤡🐟🐟🏮")
 
         self.assertEqual((41, 0), result)
 
-
     def test_large_numbers(self):
         result = parse_score("Krillion #9999 🦐 123456 🐟🦑🫧🦑🦑🐟🏮")
 
         self.assertEqual((9999, 123456), result)
-
 
     def test_missing_puzzle(self):
         result = parse_score("Krillion 🦐 415 🐟🦑🫧🦑🦑🐟🏮")
@@ -61,7 +57,6 @@ class TestScoreParser(unittest.TestCase):
         result = parse_score("Krillion #41 🦐 🐟🦑🫧🦑🦑🐟🏮")
 
         self.assertEqual(None, result)
-
 
     def test_random_message(self):
         result = parse_score("Hello everyone!")

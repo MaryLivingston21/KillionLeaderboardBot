@@ -1,3 +1,4 @@
+import argparse
 import os
 import sqlite3
 from datetime import date, datetime
@@ -22,46 +23,78 @@ START_DATE = date(2026, 8, 25)
 START_PUZZLE = 41
 
 # Eastern Time.
-# This automatically handles EST/EDT.
 PUZZLE_TIMEZONE = ZoneInfo("America/New_York")
+
+# PID file used to detect whether the normal bot is already running.
+PID_FILE = "bot.pid"
 
 
 def get_todays_puzzle():
-    """
-    Calculate today's puzzle number.
-
-    August 25, 2026 = Puzzle #41
-    August 26, 2026 = Puzzle #42
-    etc.
-    """
-
     today = datetime.now(PUZZLE_TIMEZONE).date()
-
     days_since_start = (today - START_DATE).days
-
     return START_PUZZLE + days_since_start
 
 
 def get_puzzle_for_date(requested_date):
-    """
-    Convert a date into a Krillion puzzle number.
-    """
-
-    days_since_start = (
-        requested_date - START_DATE
-    ).days
-
+    days_since_start = (requested_date - START_DATE).days
     return START_PUZZLE + days_since_start
+
+
+# -------------------------
+# PID / PROCESS MANAGEMENT
+# -------------------------
+
+def is_process_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def is_bot_already_running():
+    if not os.path.exists(PID_FILE):
+        return False
+
+    try:
+        with open(PID_FILE, "r") as file:
+            pid = int(file.read().strip())
+    except (ValueError, OSError):
+        return False
+
+    if is_process_running(pid) and (pid != os.getpid()):
+        return True
+
+    # PID file is stale.
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+
+    return False
+
+
+def create_pid_file():
+    with open(PID_FILE, "w") as file:
+        file.write(str(os.getpid()))
+
+
+def remove_pid_file():
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
 
 
 # -------------------------
 # Database
 # -------------------------
 
-db = sqlite3.connect(
-    "leaderboard.db",
-    check_same_thread=False
-)
+db = sqlite3.connect("leaderboard.db", check_same_thread=False)
 
 cursor = db.cursor()
 
@@ -94,34 +127,23 @@ db.commit()
 
 def parse_score(message):
     """
-    Expected format:
-
-        Krillion #41 🦐 415
-
+    Expected format: Krillion #41 🦐 415
     Anything after the score is ignored.
-
-    Returns:
-        (puzzle, score)
-
+    Returns: (puzzle, score)
     or None if the message is invalid.
     """
 
     parts = message.split()
 
-    # Need at least:
-    # Krillion #41 🦐 415
     if len(parts) < 4:
         return None
 
-    # First word must be "Krillion"
     if parts[0] != "Krillion":
         return None
 
-    # Second item must be a puzzle number beginning with #
     if not parts[1].startswith("#"):
         return None
 
-    # Third item must be the shrimp emoji
     if parts[2] != "🦐":
         return None
 
@@ -145,100 +167,6 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
-# -------------------------
-# Bot startup
-# -------------------------
-
-@client.event
-async def on_ready():
-
-    await tree.sync()
-
-    # Start the nightly leaderboard task.
-    if not nightly_leaderboard.is_running():
-        nightly_leaderboard.start()
-
-    print(f"Logged in as {client.user}")
-
-
-# -------------------------
-# Message handling
-# -------------------------
-
-@client.event
-async def on_message(message):
-
-    # Ignore messages sent by bots
-    if message.author.bot:
-        return
-
-    # Make sure this is a server message
-    if message.guild is None:
-        return
-
-    # Try to parse the score
-    result = parse_score(message.content)
-
-    if result is None:
-        return
-
-    puzzle, score = result
-
-    # Only accept scores for today's puzzle.
-    todays_puzzle = get_todays_puzzle()
-
-    if puzzle != todays_puzzle:
-        return
-
-    # Get the real Discord user's identity
-    user_id = message.author.id
-    username = message.author.display_name
-    guild_id = message.guild.id
-
-    # -------------------------
-    # Check existing score
-    # -------------------------
-
-    cursor.execute("""
-        SELECT score
-        FROM scores
-        WHERE guild_id = ?
-        AND user_id = ?
-        AND puzzle = ?
-    """, (
-        guild_id,
-        user_id,
-        puzzle
-    ))
-
-    existing = cursor.fetchone()
-
-    # -------------------------
-    # Already submitted
-    # -------------------------
-
-    if existing:
-        return
-
-    # -------------------------
-    # First submission
-    # -------------------------
-
-    cursor.execute("""
-        INSERT INTO scores
-        (guild_id, user_id, username, puzzle, score)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        guild_id,
-        user_id,
-        username,
-        puzzle,
-        score
-    ))
-
-    db.commit()
-
-
 # ============================================================
 # SYNC TODAY'S SCORES
 # ============================================================
@@ -255,38 +183,25 @@ async def sync_today_scores(guild):
     """
 
     today = datetime.now(PUZZLE_TIMEZONE).date()
-    puzzle = get_todays_puzzle()
+    todays_puzzle = get_todays_puzzle()
 
-    # Start/end of today in Eastern Time.
-    start_of_day = datetime.combine(
-        today,
-        datetime.min.time(),
-        tzinfo=PUZZLE_TIMEZONE
-    )
-
-    end_of_day = datetime.combine(
-        today,
-        datetime.max.time(),
-        tzinfo=PUZZLE_TIMEZONE
-    )
+    start_of_day = datetime.combine(today, datetime.min.time(), tzinfo=PUZZLE_TIMEZONE)
+    end_of_day = datetime.combine(today, datetime.max.time(), tzinfo=PUZZLE_TIMEZONE)
 
     added = 0
 
     for channel in guild.text_channels:
-
         try:
             async for message in channel.history(
-                after=start_of_day,
-                before=end_of_day,
-                limit=None,
-                oldest_first=True
+                    after=start_of_day,
+                    before=end_of_day,
+                    limit=None,
+                    oldest_first=True
             ):
 
-                # Ignore messages sent by bots.
                 if message.author.bot:
                     continue
 
-                # Parse the message.
                 result = parse_score(message.content)
 
                 if result is None:
@@ -294,15 +209,13 @@ async def sync_today_scores(guild):
 
                 message_puzzle, score = result
 
-                # Only accept today's puzzle.
-                if message_puzzle != puzzle:
+                if message_puzzle != todays_puzzle:
                     continue
 
                 user_id = message.author.id
                 username = message.author.display_name
                 guild_id = guild.id
 
-                # Check whether this user already has a score.
                 cursor.execute("""
                     SELECT score
                     FROM scores
@@ -312,7 +225,7 @@ async def sync_today_scores(guild):
                 """, (
                     guild_id,
                     user_id,
-                    puzzle
+                    todays_puzzle
                 ))
 
                 existing = cursor.fetchone()
@@ -320,7 +233,6 @@ async def sync_today_scores(guild):
                 if existing:
                     continue
 
-                # Add the score.
                 cursor.execute("""
                     INSERT INTO scores
                     (guild_id, user_id, username, puzzle, score)
@@ -329,7 +241,7 @@ async def sync_today_scores(guild):
                     guild_id,
                     user_id,
                     username,
-                    puzzle,
+                    todays_puzzle,
                     score
                 ))
 
@@ -337,15 +249,10 @@ async def sync_today_scores(guild):
                 added += 1
 
         except discord.Forbidden:
-            print(
-                f"Could not read messages in #{channel.name} "
-                f"in {guild.name}: missing permissions."
-            )
+            print(f"Could not read messages in #{channel.name} in {guild.name}: missing permissions.")
 
         except discord.HTTPException as error:
-            print(
-                f"Discord error reading #{channel.name}: {error}"
-            )
+            print(f"Discord error reading #{channel.name}: {error}")
 
     return added
 
@@ -354,15 +261,7 @@ async def sync_today_scores(guild):
 # LEADERBOARD FUNCTIONS
 # ============================================================
 
-async def create_leaderboard_embed(
-    guild_id,
-    puzzle,
-    requested_date
-):
-    """
-    Create the leaderboard embed for a guild/puzzle.
-    """
-
+async def create_leaderboard_embed(guild_id, puzzle, requested_date):
     cursor.execute("""
         SELECT username, score
         FROM scores
@@ -381,11 +280,7 @@ async def create_leaderboard_embed(
 
     lines = []
 
-    medals = [
-        "🥇",
-        "🥈",
-        "🥉"
-    ]
+    medals = ["🥇", "🥈", "🥉"]
 
     for i, (username, score) in enumerate(results):
 
@@ -394,24 +289,196 @@ async def create_leaderboard_embed(
         else:
             prefix = f"**{i + 1}.**"
 
-        lines.append(
-            f"{prefix} {username} — **{score}**"
-        )
+        lines.append(f"{prefix} {username} — **{score}**")
 
-    formatted_date = requested_date.strftime(
-        "%B %d, %Y"
-    ).replace(" 0", " ")
+    formatted_date = requested_date.strftime("%B %d, %Y").replace(" 0", " ")
 
     embed = discord.Embed(
         title=f"🏆 Puzzle #{puzzle}",
-        description=(
-            f"**{formatted_date}**\n\n"
-            + "\n".join(lines)
-        ),
+        description=(f"**{formatted_date}**\n\n" + "\n".join(lines)),
         color=discord.Color.gold()
     )
-
     return embed
+
+
+# ============================================================
+# POST NIGHTLY LEADERBOARDS
+# ============================================================
+
+async def post_nightly_leaderboards():
+    """
+    Sync and post the leaderboard for every guild that has
+    automatic leaderboards enabled.
+
+    Returns the number of leaderboards posted.
+    """
+
+    puzzle = get_todays_puzzle()
+    today = datetime.now(PUZZLE_TIMEZONE).date()
+
+    cursor.execute("""
+        SELECT
+            guild_id,
+            leaderboard_channel_id,
+            last_posted_puzzle
+        FROM guild_settings
+        WHERE auto_leaderboard_enabled = 1
+    """)
+
+    guilds = cursor.fetchall()
+
+    posted = 0
+
+    for (guild_id, channel_id, last_posted_puzzle) in guilds:
+
+        if channel_id is None:
+            continue
+
+        if last_posted_puzzle == puzzle:
+            continue
+
+        guild = client.get_guild(guild_id)
+
+        if guild is None:
+            continue
+
+        # Sync messages before creating the leaderboard.
+        added = await sync_today_scores(guild)
+
+        print(f"{guild.name}: synced {added} new score(s).")
+
+        channel = guild.get_channel(channel_id)
+
+        if channel is None:
+            continue
+
+        embed = await create_leaderboard_embed(guild_id, puzzle, today)
+
+        if embed is None:
+            continue
+
+        try:
+            await channel.send(embed=embed)
+
+            cursor.execute("""
+                UPDATE guild_settings
+                SET last_posted_puzzle = ?
+                WHERE guild_id = ?
+            """, (
+                puzzle,
+                guild_id
+            ))
+
+            db.commit()
+
+            posted += 1
+            print(f"Posted puzzle #{puzzle} leaderboard to {guild.name}.")
+
+        except discord.Forbidden:
+            print(f"Could not post leaderboard in guild {guild_id}: missing permissions.")
+
+        except discord.HTTPException as error:
+            print(f"Discord error posting leaderboard in guild {guild_id}: {error}")
+
+    return posted
+
+
+# ============================================================
+# NORMAL BOT STARTUP
+# ============================================================
+
+@client.event
+async def on_ready():
+    await tree.sync()
+
+    # Scheduled one-shot mode
+    if SCHEDULED_MODE:
+        now = datetime.now(PUZZLE_TIMEZONE)
+
+        print(f"Scheduled run started at {now.strftime('%I:%M %p')} Eastern.")
+
+        # Always sync today's scores.
+        for guild in client.guilds:
+            added = await sync_today_scores(guild)
+            print(f"{guild.name}: synced {added} new score(s).")
+
+        # Only post leaderboard at 11:59 PM.
+        if now.hour == 23 and now.minute == 59:
+            print("11:59 PM — posting nightly leaderboards.")
+            posted = await post_nightly_leaderboards()
+            print(f"Posted {posted} leaderboard(s).")
+        else:
+            print("11:59 AM — sync only. No leaderboard posted.")
+
+        # Close after the one-shot job is finished.
+        await client.close()
+        return
+
+    # Normal always-running bot
+    if not nightly_leaderboard.is_running():
+        nightly_leaderboard.start()
+
+    print(f"Logged in as {client.user}")
+
+
+# ============================================================
+# MESSAGE HANDLING
+# ============================================================
+
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.guild is None:
+        return
+
+    result = parse_score(message.content)
+
+    if result is None:
+        return
+
+    puzzle, score = result
+
+    todays_puzzle = get_todays_puzzle()
+
+    if puzzle != todays_puzzle:
+        return
+
+    user_id = message.author.id
+    username = message.author.display_name
+    guild_id = message.guild.id
+
+    cursor.execute("""
+        SELECT score
+        FROM scores
+        WHERE guild_id = ?
+        AND user_id = ?
+        AND puzzle = ?
+    """, (
+        guild_id,
+        user_id,
+        puzzle
+    ))
+
+    existing = cursor.fetchone()
+
+    if existing:
+        return
+
+    cursor.execute("""
+        INSERT INTO scores
+        (guild_id, user_id, username, puzzle, score)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        guild_id,
+        user_id,
+        username,
+        puzzle,
+        score
+    ))
+
+    db.commit()
 
 
 # ============================================================
@@ -426,23 +493,15 @@ async def create_leaderboard_embed(
     manage_guild=True
 )
 async def sync_command(
-    interaction: discord.Interaction
+        interaction: discord.Interaction
 ):
-
     if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command can only be used in a server.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
 
-    await interaction.response.defer(
-        ephemeral=True
-    )
+    await interaction.response.defer(ephemeral=True)
 
-    added = await sync_today_scores(
-        interaction.guild
-    )
+    added = await sync_today_scores(interaction.guild)
 
     await interaction.followup.send(
         f"✅ Sync complete. Added **{added} new score(s)** "
@@ -463,113 +522,47 @@ async def sync_command(
     date="Optional date (MM/DD/YYYY). Leave blank for today."
 )
 async def leaderboard(
-    interaction: discord.Interaction,
-    date: Optional[str] = None
+        interaction: discord.Interaction,
+        date: Optional[str] = None
 ):
-
-    # Make sure this is being used in a server
     if interaction.guild is None:
-        await interaction.response.send_message(
-            "This command can only be used in a server.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
 
-    # -------------------------
-    # Determine requested date
-    # -------------------------
-
     if date is None:
-
-        requested_date = datetime.now(
-            PUZZLE_TIMEZONE
-        ).date()
-
+        requested_date = datetime.now(PUZZLE_TIMEZONE).date()
     else:
-
         try:
-            requested_date = datetime.strptime(
-                date,
-                "%m/%d/%Y"
-            ).date()
-
+            requested_date = datetime.strptime(date, "%m/%d/%Y").date()
         except ValueError:
-
-            await interaction.response.send_message(
-                "Invalid date. Please use MM/DD/YYYY.",
-                ephemeral=True
-            )
-
+            await interaction.response.send_message("Invalid date. Please use MM/DD/YYYY.", ephemeral=True)
             return
 
-    # -------------------------
-    # Make sure date is valid
-    # -------------------------
-
-    today = datetime.now(
-        PUZZLE_TIMEZONE
-    ).date()
+    today = datetime.now(PUZZLE_TIMEZONE).date()
 
     if requested_date < START_DATE:
-
-        await interaction.response.send_message(
-            "There was no puzzle for that date.",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message("There was no puzzle for that date.", ephemeral=True)
         return
 
     if requested_date > today:
-
-        await interaction.response.send_message(
-            "That puzzle hasn't happened yet.",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message("That puzzle hasn't happened yet.", ephemeral=True)
         return
 
-    # -------------------------
-    # Calculate puzzle number
-    # -------------------------
-
-    puzzle = get_puzzle_for_date(
-        requested_date
-    )
+    puzzle = get_puzzle_for_date(requested_date)
 
     guild_id = interaction.guild.id
 
-    # -------------------------
-    # Create leaderboard
-    # -------------------------
-
-    embed = await create_leaderboard_embed(
-        guild_id,
-        puzzle,
-        requested_date
-    )
+    embed = await create_leaderboard_embed(guild_id, puzzle, requested_date)
 
     if embed is None:
-
-        await interaction.response.send_message(
-            f"No scores have been submitted for "
-            f"puzzle #{puzzle}.",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message(f"No scores have been submitted for puzzle #{puzzle}.", ephemeral=True)
         return
 
-    # -------------------------
-    # PRIVATE leaderboard
-    # -------------------------
-
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
-    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ============================================================
-# AUTOMATIC LEADERBOARD SETTINGS
+# /leaderboard_auto
 # ============================================================
 
 @tree.command(
@@ -595,24 +588,17 @@ async def leaderboard(
     manage_guild=True
 )
 async def leaderboard_auto(
-    interaction: discord.Interaction,
-    enabled: app_commands.Choice[str]
+        interaction: discord.Interaction,
+        enabled: app_commands.Choice[str]
 ):
-
     if interaction.guild is None:
-
-        await interaction.response.send_message(
-            "This command can only be used in a server.",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
 
     guild_id = interaction.guild.id
 
     is_enabled = enabled.value == "on"
 
-    # Make sure settings row exists.
     cursor.execute("""
         INSERT OR IGNORE INTO guild_settings
         (guild_id)
@@ -633,20 +619,14 @@ async def leaderboard_auto(
     db.commit()
 
     if is_enabled:
-
         await interaction.response.send_message(
             "✅ The nightly public leaderboard is now **ON**.\n\n"
             "It will be posted at **11:59 PM Eastern** "
             "in the configured leaderboard channel.",
             ephemeral=True
         )
-
     else:
-
-        await interaction.response.send_message(
-            "✅ The nightly public leaderboard is now **OFF**.",
-            ephemeral=True
-        )
+        await interaction.response.send_message("✅ The nightly public leaderboard is now **OFF**.", ephemeral=True)
 
 
 # ============================================================
@@ -664,22 +644,15 @@ async def leaderboard_auto(
     manage_guild=True
 )
 async def leaderboard_auto_channel(
-    interaction: discord.Interaction,
-    channel: discord.TextChannel
+        interaction: discord.Interaction,
+        channel: discord.TextChannel
 ):
-
     if interaction.guild is None:
-
-        await interaction.response.send_message(
-            "This command can only be used in a server.",
-            ephemeral=True
-        )
-
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
         return
 
     guild_id = interaction.guild.id
 
-    # Make sure settings row exists.
     cursor.execute("""
         INSERT OR IGNORE INTO guild_settings
         (guild_id)
@@ -700,123 +673,37 @@ async def leaderboard_auto_channel(
     db.commit()
 
     await interaction.response.send_message(
-        f"✅ Nightly leaderboards will be posted in "
-        f"{channel.mention}.",
+        f"✅ Nightly leaderboards will be posted in {channel.mention}.",
         ephemeral=True
     )
 
 
 # ============================================================
-# NIGHTLY LEADERBOARD TASK
+# NORMAL NIGHTLY TASK
 # ============================================================
 
 @tasks.loop(minutes=1)
 async def nightly_leaderboard():
-
     now = datetime.now(PUZZLE_TIMEZONE)
 
     # Only run at 11:59 PM Eastern.
     if now.hour != 23 or now.minute != 59:
         return
 
-    # Today's puzzle.
-    puzzle = get_todays_puzzle()
-    today = now.date()
+    print("Running normal nightly leaderboard.")
 
-    # Get every guild that has automatic leaderboards enabled.
-    cursor.execute("""
-        SELECT
-            guild_id,
-            leaderboard_channel_id,
-            last_posted_puzzle
-        FROM guild_settings
-        WHERE auto_leaderboard_enabled = 1
-    """)
-
-    guilds = cursor.fetchall()
-
-    for (
-        guild_id,
-        channel_id,
-        last_posted_puzzle
-    ) in guilds:
-
-        # No channel configured.
-        if channel_id is None:
-            continue
-
-        # Already posted this puzzle.
-        if last_posted_puzzle == puzzle:
-            continue
-
-        guild = client.get_guild(guild_id)
-
-        if guild is None:
-            continue
-
-        # Sync any scores submitted while the bot
-        # was offline before creating the leaderboard.
-        await sync_today_scores(guild)
-
-        channel = guild.get_channel(channel_id)
-
-        if channel is None:
-            continue
-
-        # Build leaderboard.
-        embed = await create_leaderboard_embed(
-            guild_id,
-            puzzle,
-            today
-        )
-
-        # Don't post an empty leaderboard.
-        if embed is None:
-            continue
-
-        try:
-
-            await channel.send(
-                embed=embed
-            )
-
-            # Record that we posted this puzzle.
-            cursor.execute("""
-                UPDATE guild_settings
-                SET last_posted_puzzle = ?
-                WHERE guild_id = ?
-            """, (
-                puzzle,
-                guild_id
-            ))
-
-            db.commit()
-
-        except discord.Forbidden:
-
-            print(
-                f"Could not post leaderboard in "
-                f"guild {guild_id}: missing permissions."
-            )
-
-        except discord.HTTPException as error:
-
-            print(
-                f"Discord error posting leaderboard "
-                f"in guild {guild_id}: {error}"
-            )
+    await post_nightly_leaderboards()
 
 
-# -------------------------
-# /help command
-# -------------------------
+# ============================================================
+# /help
+# ============================================================
 
 @tree.command(
     name="help",
     description="Show Krillion leaderboard commands"
 )
 async def help_command(interaction: discord.Interaction):
-
     embed = discord.Embed(
         title="🦐 Krillion Leaderboard Help",
         description="Commands available for the Krillion leaderboard.",
@@ -833,7 +720,8 @@ async def help_command(interaction: discord.Interaction):
         name="🏆 Leaderboard",
         value=(
             "`/leaderboard` — View today's leaderboard\n"
-            "`/leaderboard date:MM/DD/YYYY` — View a previous leaderboard"
+            "`/leaderboard date:MM/DD/YYYY` — "
+            "View a previous leaderboard"
         ),
         inline=False
     )
@@ -861,14 +749,76 @@ async def help_command(interaction: discord.Interaction):
 
 
 # ============================================================
-# Start bot
+# ONE-SHOT SCHEDULED MODE
 # ============================================================
 
-if __name__ == "__main__":
+SCHEDULED_MODE = False
+
+
+async def run_scheduled_mode():
+    print("Starting scheduled mode.")
+
+    try:
+        await client.start(TOKEN)
+    finally:
+        await client.close()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    global SCHEDULED_MODE
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="Run the scheduled sync/post once and then exit."
+    )
+
+    args = parser.parse_args()
 
     if not TOKEN:
-        raise RuntimeError(
-            "DISCORD_TOKEN is not set in the environment."
-        )
+        raise RuntimeError("DISCORD_TOKEN is not set in the environment.")
 
-    client.run(TOKEN)
+    # --------------------------------------------------------
+    # SCHEDULED MODE
+    # --------------------------------------------------------
+
+    if args.scheduled:
+        if is_bot_already_running():
+            print("Normal bot is already running. Skipping scheduled job.")
+            return
+
+        print("Normal bot is not running. Starting scheduled job.")
+
+        SCHEDULED_MODE = True
+
+        try:
+            asyncio.run(run_scheduled_mode())
+        except KeyboardInterrupt:
+            print("Scheduled job interrupted.")
+        return
+
+    # --------------------------------------------------------
+    # NORMAL BOT MODE
+    # --------------------------------------------------------
+
+    if is_bot_already_running():
+        raise RuntimeError("Another copy of the bot is already running.")
+
+    create_pid_file()
+
+    try:
+        client.run(TOKEN)
+    finally:
+        remove_pid_file()
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    main()
